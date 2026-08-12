@@ -94,7 +94,7 @@ CATEGORIES = {
 }
 
 WELCOME = (
-    "👋 <b>Welcome to NomardDesk</b>\n\n"
+    "👋 <b>Hi, ready to work?</b>\n\n"
     "Pick what you need below. Send me a sample or a link — "
     "I handle it by hand and send the result straight back here.\n\n"
     "Usually within a few hours."
