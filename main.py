@@ -473,58 +473,116 @@ def make_qr(data: str) -> BufferedInputFile:
     return BufferedInputFile(buf.read(), filename="pay.png")
 
 
-def invoice_caption(inv: dict, state: str = "waiting",
-                    secs_left: int = 0, attempt: int = 0) -> str:
+def pay_kb(iid: str, state: str) -> InlineKeyboardMarkup:
+    if state == "waiting":
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ I've paid", callback_data=f"check:{iid}")],
+            [InlineKeyboardButton(text="✖️ Cancel", callback_data=f"kill:{iid}")],
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🏠 Menu", callback_data="menu")]])
+
+
+def card_text(inv: dict, state: str, secs_left: int = 0, attempt: int = 0) -> str:
+    ch = CHAINS[inv["chain"]]
+    plan = PLANS[inv["plan"]]
+
+    if state == "verifying":
+        dots = "." * (attempt % 4)
+        return (f"🔍 <b>Verifying your payment{dots}</b>\n\n"
+                f"Checking the {ch['label']} network for your "
+                f"<code>{inv['amount']}</code> {ch['asset']}.\n\n"
+                f"Step {attempt} of {MANUAL_TRIES} — hang on.")
+
+    if state == "searching":
+        return ("⏳ <b>Still looking for your payment</b>\n\n"
+                "It hasn't shown up on the network yet. That's normal — "
+                "transfers can take a few minutes to confirm.\n\n"
+                "🔔 <b>You don't need to do anything.</b> I'm watching the chain "
+                "and I'll message you the second it lands.\n\n"
+                "Go ahead and use the menu meanwhile.")
+
     if state == "paid":
-        return ("✅ <b>Payment confirmed</b>\n\n"
-                "Everything's unlocked. Send /menu to start.")
+        return (f"✅ <b>Payment confirmed</b>\n\n"
+                f"{plan['label']} plan is active. Everything's unlocked.")
+
     if state == "expired":
         return ("⌛ <b>Invoice expired</b>\n\n"
-                "No payment showed up in time. Send /plans to make a new one.")
+                "No payment arrived in time. Send /plans to make a new one.")
 
-    ch = CHAINS[inv["chain"]]
+    if state == "cancelled":
+        return "✖️ <b>Invoice cancelled.</b>\n\nSend /plans whenever you're ready."
+
+    # waiting — the QR caption
     memo = (f"\n<b>Memo / comment:</b>\n<code>{inv['memo']}</code>  ← required"
             if inv["memo"] else "")
-    head = (
-        f"<b>{PLANS[inv['plan']]['label']} plan · ${PLANS[inv['plan']]['price_usd']:.0f}</b>\n\n"
+    m, s = divmod(max(0, secs_left), 60)
+    filled = min(20, max(0, int(20 * secs_left / (INVOICE_TTL_MIN * 60))))
+    bar = "█" * filled + "░" * (20 - filled)
+    return (
+        f"<b>{plan['label']} plan · ${plan['price_usd']:.0f}</b>\n\n"
         f"Scan the QR, or send manually:\n\n"
         f"<b>Amount (exact):</b>\n<code>{inv['amount']}</code> {ch['asset']}\n\n"
         f"<b>To ({ch['label']}):</b>\n<code>{ch['wallet']}</code>{memo}\n\n"
+        f"<code>{bar}</code>\n⏳ Expires in <b>{m}m {s:02d}s</b>\n\n"
+        f"👀 Unlocks automatically the moment your payment lands."
     )
 
-    if state == "verifying":
-        return head + (f"🔍 <b>Verifying your payment…</b>\n"
-                       f"Checking the chain — attempt {attempt}/{MANUAL_TRIES}.\n"
-                       f"Don't close this, it takes a few seconds.")
 
-    m, s = divmod(max(0, secs_left), 60)
-    bars = min(20, max(0, int(20 * secs_left / (INVOICE_TTL_MIN * 60))))
-    bar = "█" * bars + "░" * (20 - bars)
-    return head + (f"<code>{bar}</code>\n"
-                   f"⏳ Expires in <b>{m}m {s:02d}s</b>\n\n"
-                   f"👀 I'm watching the chain — it unlocks by itself the moment "
-                   f"your payment lands. The button is just to hurry it along.")
-
-
-def invoice_kb(iid: str, done: bool = False) -> InlineKeyboardMarkup:
-    if done:
-        return InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="📋 Menu", callback_data="menu")]])
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ I've paid", callback_data=f"check:{iid}")],
-        [InlineKeyboardButton(text="✖️ Cancel", callback_data=f"kill:{iid}")],
-    ])
-
-
-async def edit_card(bot: Bot, inv: dict, caption: str, done: bool = False):
+async def render_card(bot: Bot, inv: dict, state: str,
+                      secs_left: int = 0, attempt: int = 0):
+    """Update whichever message is currently acting as the invoice card."""
     if not inv.get("card_chat"):
         return
+    body = card_text(inv, state, secs_left, attempt)
+    kb = pay_kb(inv["id"], state)
     try:
-        await bot.edit_message_caption(
-            chat_id=inv["card_chat"], message_id=inv["card_msg"],
-            caption=caption, reply_markup=invoice_kb(inv["id"], done))
+        if inv.get("card_type") == "text":
+            await bot.edit_message_text(
+                body, chat_id=inv["card_chat"], message_id=inv["card_msg"],
+                reply_markup=kb)
+        else:
+            await bot.edit_message_caption(
+                chat_id=inv["card_chat"], message_id=inv["card_msg"],
+                caption=body, reply_markup=kb)
     except Exception:
-        pass  # "message is not modified" and friends
+        pass  # "message is not modified", deleted message, etc.
+
+
+async def set_card(iid: str, chat_id: int, msg_id: int,
+                   card_type: str, mode: str):
+    await db.collection(C_INV).document(iid).set(
+        {"card_chat": chat_id, "card_msg": msg_id,
+         "card_type": card_type, "card_mode": mode}, merge=True)
+
+
+async def notify_paid(bot: Bot, inv: dict):
+    """Flip the card to confirmed and push a separate notification. Once only."""
+    fresh = await get_invoice(inv["id"])
+    if fresh and fresh.get("paid_notified"):
+        return
+    await db.collection(C_INV).document(inv["id"]).set(
+        {"paid_notified": True}, merge=True)
+
+    inv = fresh or inv
+    await render_card(bot, inv, "paid")
+
+    plan = PLANS[inv["plan"]]
+    sub = await get_sub(inv["uid"])
+    until = ""
+    if sub and sub.get("expires_at"):
+        until = "\nActive until <b>" + time.strftime(
+            "%d %b, %H:%M UTC", time.gmtime(sub["expires_at"])) + "</b>"
+    try:
+        await bot.send_message(
+            inv["uid"],
+            f"🎉 <b>Payment received!</b>\n\n"
+            f"{plan['label']} plan unlocked — "
+            f"<code>{inv['amount']}</code> {CHAINS[inv['chain']]['asset']} confirmed."
+            f"{until}\n\nAll five categories are open. Tap below to start.",
+            reply_markup=menu_kb())
+    except Exception as e:
+        log.warning("paid notify %s: %s", inv["uid"], e)
 
 
 async def watch_invoice(bot: Bot, iid: str):
@@ -540,19 +598,19 @@ async def watch_invoice(bot: Bot, iid: str):
         left = INVOICE_TTL_MIN * 60 - (now() - inv["created"])
         if left <= 0:
             await close_invoice(iid, "expired")
-            await edit_card(bot, inv, invoice_caption(inv, "expired"), done=True)
+            await render_card(bot, inv, "expired")
             return
 
         try:
             if await settle(inv):
-                await edit_card(bot, inv, invoice_caption(inv, "paid"), done=True)
-                await bot.send_message(
-                    inv["uid"], "✅ Payment received — you're all set. /menu")
+                await notify_paid(bot, inv)
                 return
         except Exception as e:
             log.warning("watch settle %s: %s", iid, e)
 
-        await edit_card(bot, inv, invoice_caption(inv, "waiting", left))
+        # in verify mode the card shows a status message — don't stomp it
+        if inv.get("card_mode") != "verify":
+            await render_card(bot, inv, "waiting", left)
 
 
 # ==========================================================================
@@ -692,11 +750,10 @@ async def cb_chain(cq: CallbackQuery, bot: Bot):
     card = await bot.send_photo(
         cq.from_user.id,
         make_qr(payment_uri(inv)),
-        caption=invoice_caption(inv, "waiting", INVOICE_TTL_MIN * 60),
-        reply_markup=invoice_kb(inv["id"]))
+        caption=card_text(inv, "waiting", INVOICE_TTL_MIN * 60),
+        reply_markup=pay_kb(inv["id"], "waiting"))
 
-    await db.collection(C_INV).document(inv["id"]).set(
-        {"card_chat": card.chat.id, "card_msg": card.message_id}, merge=True)
+    await set_card(inv["id"], card.chat.id, card.message_id, "photo", "qr")
 
     asyncio.create_task(watch_invoice(bot, inv["id"]))
 
@@ -712,7 +769,9 @@ async def cb_kill(cq: CallbackQuery):
         await cq.message.delete()
     except Exception:
         pass
-    await cq.message.answer(await status_line(cq.from_user.id), reply_markup=menu_kb())
+    await cq.message.answer(
+        "✖️ Invoice cancelled.\n\n" + await status_line(cq.from_user.id),
+        reply_markup=menu_kb())
 
 
 @user_router.callback_query(F.data.startswith("check:"))
@@ -722,30 +781,44 @@ async def cb_check(cq: CallbackQuery, bot: Bot):
     if not inv:
         return await cq.answer("Invoice not found.", show_alert=True)
     if inv["status"] == "paid":
-        return await cq.answer("Already confirmed — you're good. /menu", show_alert=True)
+        return await cq.answer("Already confirmed — you're good to go.",
+                               show_alert=True)
     if inv["status"] != "pending":
-        return await cq.answer("This invoice is closed. /plans for a new one.",
+        return await cq.answer("This invoice is closed. Send /plans for a new one.",
                                show_alert=True)
 
+    # answer straight away — the query dies after ~15s and this loop runs longer
     await cq.answer("Checking…")
+
     MANUAL_LOCK.add(iid)
     try:
+        # QR and address go away; a status message takes their place
+        try:
+            await cq.message.delete()
+        except Exception:
+            pass
+
+        status = await bot.send_message(
+            cq.from_user.id,
+            card_text(inv, "verifying", attempt=1),
+            reply_markup=pay_kb(iid, "verifying"))
+        await set_card(iid, status.chat.id, status.message_id, "text", "verify")
+        inv = await get_invoice(iid)
+
         for attempt in range(1, MANUAL_TRIES + 1):
-            await edit_card(bot, inv, invoice_caption(inv, "verifying", attempt=attempt))
+            if attempt > 1:
+                await render_card(bot, inv, "verifying", attempt=attempt)
             try:
                 if await settle(inv):
-                    await edit_card(bot, inv, invoice_caption(inv, "paid"), done=True)
+                    await notify_paid(bot, inv)
                     return
             except Exception as e:
                 log.warning("manual settle %s: %s", iid, e)
             if attempt < MANUAL_TRIES:
                 await asyncio.sleep(MANUAL_GAP)
 
-        left = INVOICE_TTL_MIN * 60 - (now() - inv["created"])
-        await edit_card(bot, inv, invoice_caption(inv, "waiting", left))
-        await cq.answer(
-            "Nothing on chain yet. Payments can take a few minutes — "
-            "I'll unlock it automatically when it lands.", show_alert=True)
+        # not found yet — the watcher and the 45s job keep looking
+        await render_card(bot, inv, "searching")
     finally:
         MANUAL_LOCK.discard(iid)
 
@@ -1033,12 +1106,21 @@ async def cmd_id(m: Message):
 #  9. BACKGROUND JOBS
 # ==========================================================================
 
-async def job_invoices():
+async def job_invoices(bot: Bot):
     for inv in await pending_invoices():
         try:
-            await settle(inv)
+            if S_expired(inv):
+                await close_invoice(inv["id"], "expired")
+                await render_card(bot, inv, "expired")
+                continue
+            if await settle(inv):
+                await notify_paid(bot, inv)
         except Exception as e:
             log.warning("settle %s: %s", inv["id"], e)
+
+
+def S_expired(inv: dict) -> bool:
+    return now() - inv["created"] > INVOICE_TTL_MIN * 60
 
 
 async def job_expiry(bot: Bot):
@@ -1076,7 +1158,7 @@ async def job_stale(bot: Bot):
 
 def start_jobs(bot: Bot):
     sch = AsyncIOScheduler()
-    sch.add_job(job_invoices, "interval", seconds=45)
+    sch.add_job(job_invoices, "interval", seconds=45, args=[bot])
     sch.add_job(job_expiry, "interval", minutes=15, args=[bot])
     sch.add_job(job_stale, "interval", minutes=30, args=[bot])
     sch.start()
