@@ -17,7 +17,11 @@ import random
 import secrets
 import time
 
+import io
+from urllib.parse import quote_plus
+
 import httpx
+import qrcode
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -26,6 +30,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -93,12 +98,13 @@ CATEGORIES = {
     },
 }
 
-WELCOME = (
-    "👋 <b>Hi, ready to work?</b>\n\n"
-    "Pick what you need below. Send me a sample or a link — "
-    "I handle it by hand and send the result straight back here.\n\n"
-    "Usually within a few hours."
-)
+WELCOME = "Hi, ready to work?"
+
+# how often the live invoice card refreshes its countdown
+QR_TICK_SECONDS = 20
+# manual "I've paid" check: attempts x gap
+MANUAL_TRIES = 6
+MANUAL_GAP = 5
 
 CHAINS = {
     "ton":   {"label": "TON",          "asset": "TON",  "wallet": TON_WALLET,  "memo": True},
@@ -435,6 +441,121 @@ async def settle(inv: dict) -> bool:
 
 
 # ==========================================================================
+#  4b. INVOICE CARD — QR + LIVE COUNTDOWN
+# ==========================================================================
+
+# invoices currently being checked by hand — stops the watcher fighting the edit
+MANUAL_LOCK: set[str] = set()
+
+
+def payment_uri(inv: dict) -> str:
+    """Deep link a wallet app can scan."""
+    ch = CHAINS[inv["chain"]]
+    if inv["chain"] == "ton":
+        nano = int(round(inv["amount"] * 1e9))
+        uri = f"ton://transfer/{ch['wallet']}?amount={nano}"
+        if inv["memo"]:
+            uri += f"&text={quote_plus(inv['memo'])}"
+        return uri
+    # TRON / BSC wallets scan a bare address reliably; amount goes in the caption
+    return ch["wallet"]
+
+
+def make_qr(data: str) -> BufferedInputFile:
+    qr = qrcode.QRCode(version=None, box_size=10, border=2,
+                       error_correction=qrcode.constants.ERROR_CORRECT_M)
+    qr.add_data(data)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return BufferedInputFile(buf.read(), filename="pay.png")
+
+
+def invoice_caption(inv: dict, state: str = "waiting",
+                    secs_left: int = 0, attempt: int = 0) -> str:
+    if state == "paid":
+        return ("✅ <b>Payment confirmed</b>\n\n"
+                "Everything's unlocked. Send /menu to start.")
+    if state == "expired":
+        return ("⌛ <b>Invoice expired</b>\n\n"
+                "No payment showed up in time. Send /plans to make a new one.")
+
+    ch = CHAINS[inv["chain"]]
+    memo = (f"\n<b>Memo / comment:</b>\n<code>{inv['memo']}</code>  ← required"
+            if inv["memo"] else "")
+    head = (
+        f"<b>{PLANS[inv['plan']]['label']} plan · ${PLANS[inv['plan']]['price_usd']:.0f}</b>\n\n"
+        f"Scan the QR, or send manually:\n\n"
+        f"<b>Amount (exact):</b>\n<code>{inv['amount']}</code> {ch['asset']}\n\n"
+        f"<b>To ({ch['label']}):</b>\n<code>{ch['wallet']}</code>{memo}\n\n"
+    )
+
+    if state == "verifying":
+        return head + (f"🔍 <b>Verifying your payment…</b>\n"
+                       f"Checking the chain — attempt {attempt}/{MANUAL_TRIES}.\n"
+                       f"Don't close this, it takes a few seconds.")
+
+    m, s = divmod(max(0, secs_left), 60)
+    bars = min(20, max(0, int(20 * secs_left / (INVOICE_TTL_MIN * 60))))
+    bar = "█" * bars + "░" * (20 - bars)
+    return head + (f"<code>{bar}</code>\n"
+                   f"⏳ Expires in <b>{m}m {s:02d}s</b>\n\n"
+                   f"👀 I'm watching the chain — it unlocks by itself the moment "
+                   f"your payment lands. The button is just to hurry it along.")
+
+
+def invoice_kb(iid: str, done: bool = False) -> InlineKeyboardMarkup:
+    if done:
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📋 Menu", callback_data="menu")]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ I've paid", callback_data=f"check:{iid}")],
+        [InlineKeyboardButton(text="✖️ Cancel", callback_data=f"kill:{iid}")],
+    ])
+
+
+async def edit_card(bot: Bot, inv: dict, caption: str, done: bool = False):
+    if not inv.get("card_chat"):
+        return
+    try:
+        await bot.edit_message_caption(
+            chat_id=inv["card_chat"], message_id=inv["card_msg"],
+            caption=caption, reply_markup=invoice_kb(inv["id"], done))
+    except Exception:
+        pass  # "message is not modified" and friends
+
+
+async def watch_invoice(bot: Bot, iid: str):
+    """Live countdown + auto-settle. Runs until paid, expired or cancelled."""
+    while True:
+        await asyncio.sleep(QR_TICK_SECONDS)
+        inv = await get_invoice(iid)
+        if not inv or inv["status"] != "pending":
+            return
+        if iid in MANUAL_LOCK:
+            continue
+
+        left = INVOICE_TTL_MIN * 60 - (now() - inv["created"])
+        if left <= 0:
+            await close_invoice(iid, "expired")
+            await edit_card(bot, inv, invoice_caption(inv, "expired"), done=True)
+            return
+
+        try:
+            if await settle(inv):
+                await edit_card(bot, inv, invoice_caption(inv, "paid"), done=True)
+                await bot.send_message(
+                    inv["uid"], "✅ Payment received — you're all set. /menu")
+                return
+        except Exception as e:
+            log.warning("watch settle %s: %s", iid, e)
+
+        await edit_card(bot, inv, invoice_caption(inv, "waiting", left))
+
+
+# ==========================================================================
 #  5. KEYBOARDS
 # ==========================================================================
 
@@ -553,42 +674,80 @@ async def cb_plan(cq: CallbackQuery):
 
 
 @user_router.callback_query(F.data.startswith("chain:"))
-async def cb_chain(cq: CallbackQuery):
+async def cb_chain(cq: CallbackQuery, bot: Bot):
     _, plan, chain = cq.data.split(":")
     await cq.answer("Building invoice…")
     try:
         inv = await open_invoice(cq.from_user.id, plan, chain)
     except Exception as e:
         log.error("invoice fail: %s", e)
-        return await cq.message.edit_text("⚠️ Couldn't build the invoice. Try again in a minute.")
+        return await cq.message.edit_text(
+            "⚠️ Couldn't build the invoice. Try again in a minute.")
 
-    ch = CHAINS[chain]
-    memo = (f"\n<b>Memo / comment:</b>\n<code>{inv['memo']}</code>  ← required"
-            if inv["memo"] else "")
-    await cq.message.edit_text(
-        f"<b>{PLANS[plan]['label']} plan</b>\n\n"
-        f"Send <b>exactly</b>:\n<code>{inv['amount']}</code> {ch['asset']}\n\n"
-        f"<b>To ({ch['label']}):</b>\n<code>{ch['wallet']}</code>{memo}\n\n"
-        f"⚠️ The exact amount is how I find your payment — don't round it.\n"
-        f"Invoice expires in {INVOICE_TTL_MIN} min.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ I've paid", callback_data=f"check:{inv['id']}")],
-            [InlineKeyboardButton(text="⬅️ Back", callback_data="plans")],
-        ]))
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+
+    card = await bot.send_photo(
+        cq.from_user.id,
+        make_qr(payment_uri(inv)),
+        caption=invoice_caption(inv, "waiting", INVOICE_TTL_MIN * 60),
+        reply_markup=invoice_kb(inv["id"]))
+
+    await db.collection(C_INV).document(inv["id"]).set(
+        {"card_chat": card.chat.id, "card_msg": card.message_id}, merge=True)
+
+    asyncio.create_task(watch_invoice(bot, inv["id"]))
+
+
+@user_router.callback_query(F.data.startswith("kill:"))
+async def cb_kill(cq: CallbackQuery):
+    iid = cq.data.split(":")[1]
+    inv = await get_invoice(iid)
+    if inv and inv["status"] == "pending":
+        await close_invoice(iid, "cancelled")
+    await cq.answer("Cancelled.")
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+    await cq.message.answer(await status_line(cq.from_user.id), reply_markup=menu_kb())
 
 
 @user_router.callback_query(F.data.startswith("check:"))
-async def cb_check(cq: CallbackQuery):
-    inv = await get_invoice(cq.data.split(":")[1])
+async def cb_check(cq: CallbackQuery, bot: Bot):
+    iid = cq.data.split(":")[1]
+    inv = await get_invoice(iid)
     if not inv:
         return await cq.answer("Invoice not found.", show_alert=True)
-    await cq.answer("Checking the chain…")
-    if await settle(inv):
-        await cq.message.edit_text(
-            f"✅ <b>Payment confirmed</b>\n\n{await status_line(cq.from_user.id)}\n\n"
-            "Everything's unlocked. /menu to start.")
-    else:
-        await cq.answer("Not on chain yet. Wait a minute and tap again.", show_alert=True)
+    if inv["status"] == "paid":
+        return await cq.answer("Already confirmed — you're good. /menu", show_alert=True)
+    if inv["status"] != "pending":
+        return await cq.answer("This invoice is closed. /plans for a new one.",
+                               show_alert=True)
+
+    await cq.answer("Checking…")
+    MANUAL_LOCK.add(iid)
+    try:
+        for attempt in range(1, MANUAL_TRIES + 1):
+            await edit_card(bot, inv, invoice_caption(inv, "verifying", attempt=attempt))
+            try:
+                if await settle(inv):
+                    await edit_card(bot, inv, invoice_caption(inv, "paid"), done=True)
+                    return
+            except Exception as e:
+                log.warning("manual settle %s: %s", iid, e)
+            if attempt < MANUAL_TRIES:
+                await asyncio.sleep(MANUAL_GAP)
+
+        left = INVOICE_TTL_MIN * 60 - (now() - inv["created"])
+        await edit_card(bot, inv, invoice_caption(inv, "waiting", left))
+        await cq.answer(
+            "Nothing on chain yet. Payments can take a few minutes — "
+            "I'll unlock it automatically when it lands.", show_alert=True)
+    finally:
+        MANUAL_LOCK.discard(iid)
 
 
 @user_router.callback_query(F.data.startswith("pick:"))
