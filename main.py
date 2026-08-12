@@ -10,6 +10,7 @@ Deploy: push to GitHub -> Railway -> set env vars -> done.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -281,6 +282,21 @@ async def quote(chain: str, usd: float) -> float:
     return round(usd, 2)
 
 
+def _ton_comment(m: dict) -> str:
+    """TonCenter returns the comment in a few shapes depending on the wallet."""
+    txt = (m.get("message") or "").strip()
+    if txt:
+        return txt
+    data = m.get("msg_data") or {}
+    raw = data.get("text") or ""
+    if raw:
+        try:
+            return base64.b64decode(raw).decode("utf-8", "ignore").strip()
+        except Exception:
+            return raw.strip()
+    return ""
+
+
 async def _ton_in() -> list[dict]:
     url = "https://toncenter.com/api/v2/getTransactions"
     params = {"address": TON_WALLET, "limit": 50}
@@ -296,7 +312,7 @@ async def _ton_in() -> list[dict]:
         out.append({
             "tx": t["transaction_id"]["hash"],
             "amount": int(m.get("value", 0)) / 1e9,
-            "memo": (m.get("message") or "").strip(),
+            "memo": _ton_comment(m),
             "ts": t.get("utime", 0),
         })
     return out
@@ -417,11 +433,13 @@ async def open_invoice(uid: int, plan: str, chain: str) -> dict:
 
 
 def _matches(inv: dict, pay: dict) -> bool:
-    if pay["ts"] < inv["created"] - 120:
+    """Memo OR exact amount. Either one alone is proof enough — the dust in
+    every amount makes it unique, and comments often don't survive the trip."""
+    if pay["ts"] < inv["created"] - 300:
         return False
-    if inv["memo"]:
-        return inv["memo"].lower() in pay["memo"].lower()
-    return abs(pay["amount"] - inv["amount"]) < 1e-6
+    if inv["memo"] and inv["memo"].lower() in (pay["memo"] or "").lower():
+        return True
+    return round(pay["amount"], 6) == round(inv["amount"], 6)
 
 
 async def settle(inv: dict) -> bool:
@@ -430,13 +448,23 @@ async def settle(inv: dict) -> bool:
     if now() - inv["created"] > INVOICE_TTL_MIN * 60:
         await close_invoice(inv["id"], "expired")
         return False
-    for pay in await incoming(inv["chain"]):
+
+    payments = await incoming(inv["chain"])
+    for pay in payments:
         if not _matches(inv, pay) or await tx_seen(pay["tx"]):
             continue
         await close_invoice(inv["id"], "paid", pay["tx"])
         await grant(inv["uid"], inv["plan"])
-        log.info("PAID %s uid=%s %s", inv["id"], inv["uid"], inv["plan"])
+        log.info("PAID %s uid=%s %s (%s %s)", inv["id"], inv["uid"],
+                 inv["plan"], pay["amount"], inv["chain"])
         return True
+
+    # nothing matched — show what we did see, so mismatches are debuggable
+    recent = [p for p in payments if p["ts"] > inv["created"] - 300]
+    if recent:
+        log.info("NO MATCH inv=%s want=%s memo=%r | saw: %s",
+                 inv["id"], round(inv["amount"], 6), inv["memo"],
+                 [(round(p["amount"], 6), p["memo"][:24]) for p in recent[:5]])
     return False
 
 
