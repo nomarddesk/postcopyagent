@@ -835,6 +835,11 @@ async def cb_check(cq: CallbackQuery, bot: Bot):
     # answer straight away — the query dies after ~15s and this loop runs longer
     await cq.answer("Checking…")
 
+    # remember this person is actively claiming to have paid this invoice —
+    # if their payment lands mismatched, the orphan alert can point back here
+    await db.collection(C_INV).document(iid).set(
+        {"claimed_paid_at": now()}, merge=True)
+
     MANUAL_LOCK.add(iid)
     try:
         # QR and address go away; a status message takes their place
@@ -914,7 +919,7 @@ async def capture(m: Message, state: FSMContext, bot: Bot):
         await state.clear()
         return await m.answer("🔒 Free requests used up.", reply_markup=plans_kb())
 
-    note = m.text or m.caption or f"[{m.content_type}]"
+    note = m.text or m.caption or f"[sent {m.content_type.value}]"
     order = await create_order(uid, m.from_user.username, cid, note, paid=(why == "sub"))
     await state.clear()
 
@@ -1069,8 +1074,98 @@ async def cb_reject(cq: CallbackQuery, bot: Bot):
     await cq.answer("Rejected.")
 
 
-@admin_router.message(Command("queue"))
-async def cmd_queue(m: Message):
+@admin_router.callback_query(F.data.startswith("grec:"))
+async def cb_grant_recipient(cq: CallbackQuery):
+    """Admin picked which buyer to credit — now show the duration picker."""
+    if not is_admin(cq.from_user.id):
+        return await cq.answer("Not for you.", show_alert=True)
+    _, txpref, uid = cq.data.split(":")
+    uid = int(uid)
+
+    # find the pending orphan by tx prefix
+    orphan = None
+    async for d in db.collection("nd_orphans").stream():
+        o = d.to_dict()
+        if o["tx"].startswith(txpref) and not o.get("resolved"):
+            orphan = o
+            break
+    if not orphan:
+        return await cq.answer("This one's already handled.", show_alert=True)
+
+    cand = next((c for c in orphan["cands"] if c["uid"] == uid), None)
+    plan = cand["plan"] if cand else "daily"
+    # remember the choice on the orphan for the next tap
+    await db.collection("nd_orphans").document(orphan["tx"]).set(
+        {"pick_uid": uid, "pick_plan": plan}, merge=True)
+
+    who = f"@{cand['username']}" if cand and cand.get("username") not in (None, "—") \
+          else f"id {uid}"
+    await cq.message.edit_text(
+        f"{cq.message.text}\n\n"
+        f"→ Crediting <b>{who}</b> on the <b>{PLANS[plan]['label']}</b> plan.\n"
+        f"How long?",
+        reply_markup=span_kb(uid))
+    await cq.answer()
+
+
+@admin_router.callback_query(F.data.startswith("gspn:"))
+async def cb_grant_span(cq: CallbackQuery, bot: Bot):
+    """Admin picked a duration — grant it and tell the user."""
+    if not is_admin(cq.from_user.id):
+        return await cq.answer("Not for you.", show_alert=True)
+    _, uid, label = cq.data.split(":")
+    uid = int(uid)
+    days = GRANT_SPANS.get(label, 1)
+
+    # locate the orphan holding this pick
+    orphan = None
+    async for d in db.collection("nd_orphans").stream():
+        o = d.to_dict()
+        if o.get("pick_uid") == uid and not o.get("resolved"):
+            orphan = o
+            break
+
+    plan = (orphan or {}).get("pick_plan", "daily")
+    await grant_days(uid, plan, days)
+
+    if orphan:
+        await db.collection("nd_orphans").document(orphan["tx"]).set(
+            {"resolved": True, "granted_days": days, "granted_uid": uid}, merge=True)
+
+    # tell the buyer
+    try:
+        await bot.send_message(
+            uid,
+            f"🎉 <b>Payment approved!</b>\n\n"
+            f"You've been granted <b>{days} day{'s' if days != 1 else ''}</b> "
+            f"of access.\n\nAll categories are open — tap below to start.",
+            reply_markup=menu_kb())
+    except Exception as e:
+        log.warning("grant notify %s: %s", uid, e)
+
+    await cq.message.edit_text(
+        f"✅ Granted <b>{days} day{'s' if days != 1 else ''}</b> "
+        f"({PLANS[plan]['label']}) to <code>{uid}</code>.\n"
+        f"The buyer has been notified.")
+    await cq.answer("Granted.")
+
+
+@admin_router.callback_query(F.data.startswith("gign:"))
+async def cb_grant_ignore(cq: CallbackQuery):
+    if not is_admin(cq.from_user.id):
+        return await cq.answer("Not for you.", show_alert=True)
+    txpref = cq.data.split(":")[1]
+    async for d in db.collection("nd_orphans").stream():
+        o = d.to_dict()
+        if o["tx"].startswith(txpref) and not o.get("resolved"):
+            await db.collection("nd_orphans").document(o["tx"]).set(
+                {"resolved": True, "ignored": True}, merge=True)
+            break
+    await cq.message.edit_text(f"🙈 Dismissed.\n\n{cq.message.text}")
+    await cq.answer("Ignored.")
+
+
+
     if not is_admin(m.from_user.id):
         return
     rows = await open_orders()
@@ -1104,16 +1199,35 @@ async def cmd_stats(m: Message):
 
 
 @admin_router.message(Command("give"))
-async def cmd_give(m: Message):
-    """/give <uid> <daily|weekly|monthly>"""
+async def cmd_give(m: Message, bot: Bot):
+    """/give <uid> <daily|weekly|monthly> [days]
+    The optional day count overrides the plan length (for mismatch approvals)."""
     if not is_admin(m.from_user.id):
         return
+    parts = m.text.split()
     try:
-        _, uid, plan = m.text.split()
-        await grant(int(uid), plan)
-        await m.answer(f"✅ {plan} granted to {uid}")
-    except Exception as e:
-        await m.answer(f"Usage: <code>/give &lt;uid&gt; &lt;daily|weekly|monthly&gt;</code>\n{e}")
+        uid = int(parts[1])
+        plan = parts[2]
+        if plan not in PLANS:
+            return await m.answer(f"Unknown plan. Use: {', '.join(PLANS)}")
+        if len(parts) >= 4:
+            days = int(parts[3])
+            await grant_days(uid, plan, days)
+            span = f"{days} day{'s' if days != 1 else ''}"
+        else:
+            await grant(uid, plan)
+            span = f"{PLANS[plan]['label']} ({PLANS[plan]['days']}d)"
+        try:
+            await bot.send_message(
+                uid, f"🎉 Access granted — {span}. Tap below to start.",
+                reply_markup=menu_kb())
+        except Exception:
+            pass
+        await m.answer(f"✅ {span} → <code>{uid}</code>. Buyer notified.")
+    except (IndexError, ValueError):
+        await m.answer(
+            "Usage: <code>/give &lt;uid&gt; &lt;daily|weekly|monthly&gt; [days]</code>\n"
+            "Example: <code>/give 123456 weekly 4</code> — 4 days on the weekly plan.")
 
 
 @admin_router.message(Command("take"))
@@ -1151,8 +1265,53 @@ async def cmd_id(m: Message):
 #  9. BACKGROUND JOBS
 # ==========================================================================
 
-FUZZY_TOL = 0.04          # accept within 4% if only one invoice could fit
-ORPHAN_WINDOW = 3 * 3600  # only chase payments from the last few hours
+# admin can grant these exact spans from the orphan card (label -> days)
+GRANT_SPANS = {
+    "1d": 1, "2d": 2, "3d": 3, "4d": 4, "5d": 5, "6d": 6,
+    "1w": 7, "2w": 14, "1m": 30,
+}
+
+
+async def grant_days(uid: int, plan: str, days: int):
+    """Grant an arbitrary number of days (for partial/mismatch approvals)."""
+    sub = await get_sub(uid)
+    live = sub and sub.get("active") and sub["expires_at"] > now()
+    start = sub["expires_at"] if live else now()
+    await save_sub({
+        "uid": uid, "plan": plan, "active": True,
+        "started_at": now(), "expires_at": start + days * 86400,
+        "notified": False,
+    })
+
+
+def orphan_kb(tx: str, cands: list[dict]) -> InlineKeyboardMarkup:
+    """Buttons to credit a specific buyer, or dismiss."""
+    rows = []
+    for c in cands[:4]:
+        who = f"@{c.get('username')}" if c.get("username") and c["username"] != "—" \
+              else f"id {c['uid']}"
+        rows.append([InlineKeyboardButton(
+            text=f"✅ Credit {who}",
+            callback_data=f"grec:{tx[:16]}:{c['uid']}")])
+    rows.append([InlineKeyboardButton(
+        text="🙈 Ignore", callback_data=f"gign:{tx[:16]}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def span_kb(uid: int) -> InlineKeyboardMarkup:
+    """Duration picker shown after admin chooses who to credit."""
+    labels = list(GRANT_SPANS.keys())
+    rows, row = [], []
+    for lab in labels:
+        row.append(InlineKeyboardButton(text=lab, callback_data=f"gspn:{uid}:{lab}"))
+        if len(row) == 3:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+
 
 
 async def orphan_seen(tx: str) -> bool:
@@ -1164,23 +1323,70 @@ async def orphan_seen(tx: str) -> bool:
     return False
 
 
+async def recent_claimants(chain: str, amount: float) -> list[dict]:
+    """People who tapped 'I've paid' recently — the likely sender of an
+    unmatched payment. Closest expected amount first."""
+    since = now() - ORPHAN_WINDOW
+    q = db.collection(C_INV).where(
+        filter=FieldFilter("chain", "==", chain))
+    out = []
+    async for d in q.stream():
+        inv = d.to_dict()
+        if not inv.get("claimed_paid_at"):
+            continue
+        if inv["claimed_paid_at"] < since:
+            continue
+        if inv["status"] == "paid":
+            continue
+        out.append(inv)
+    out.sort(key=lambda i: abs(i["amount"] - amount))
+    return out
+
+
 async def alert_orphan(bot: Bot, chain: str, pay: dict, cands: list[dict]):
     if not INBOX_CHAT_ID or await orphan_seen(pay["tx"]):
         return
     ch = CHAINS[chain]
+
+    # widen candidates: exact-fuzzy matches, plus anyone who recently claimed
+    claimants = await recent_claimants(chain, pay["amount"])
+    seen = {c["uid"] for c in cands}
+    for c in claimants:
+        if c["uid"] not in seen:
+            cands.append(c)
+            seen.add(c["uid"])
+
+    # stash the decision so the buttons know the amount/plan later
+    await db.collection("nd_orphans").document(pay["tx"]).set({
+        "tx": pay["tx"], "chain": chain, "amount": pay["amount"],
+        "at": now(), "resolved": False,
+        "cands": [{"uid": c["uid"], "username": c.get("username", "—"),
+                   "plan": c["plan"], "amount": c["amount"]} for c in cands[:4]],
+    }, merge=True)
+
     if cands:
-        why = (f"{len(cands)} open invoices could match — too close to call:\n"
-               + "\n".join(f"• <code>{c['amount']}</code> → uid <code>{c['uid']}</code>"
-                           for c in cands[:5]))
+        lines = []
+        for c in cands[:4]:
+            who = f"@{c['username']}" if c.get("username") and c["username"] != "—" \
+                  else f"id <code>{c['uid']}</code>"
+            gap = pay["amount"] - c["amount"]
+            tag = "exact" if abs(gap) < 1e-6 else f"{gap:+.2f} vs their {c['amount']}"
+            lines.append(f"• {who} — {PLANS[c['plan']]['label']} ({tag})")
+        body = ("Likely one of these — they tapped “I've paid” recently:\n"
+                + "\n".join(lines) +
+                "\n\nTap to credit, then pick how long.")
     else:
-        why = "No open invoice comes close."
+        body = ("Nobody has an open invoice near this amount.\n"
+                "If you know who it is, use "
+                "<code>/give &lt;uid&gt; &lt;plan&gt;</code>.")
+
     await bot.send_message(
         INBOX_CHAT_ID,
         f"💰 <b>Unmatched payment</b>\n\n"
         f"Received <b>{pay['amount']}</b> {ch['asset']} ({ch['label']})\n"
         f"Comment: <code>{pay['memo'] or '—'}</code>\n"
-        f"Tx: <code>{pay['tx'][:24]}…</code>\n\n{why}\n\n"
-        f"Credit by hand with <code>/give &lt;uid&gt; &lt;plan&gt;</code>")
+        f"Tx: <code>{pay['tx'][:24]}…</code>\n\n{body}",
+        reply_markup=orphan_kb(pay["tx"], cands) if cands else None)
 
 
 async def job_reconcile(bot: Bot):
