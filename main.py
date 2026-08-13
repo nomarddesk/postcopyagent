@@ -1102,7 +1102,7 @@ async def cb_grant_recipient(cq: CallbackQuery):
     cand = next((c for c in orphan["cands"] if c["uid"] == uid), None)
     plan = cand["plan"] if cand else "daily"
     # remember the choice on the orphan for the next tap
-    await db.collection("nd_orphans").document(orphan["tx"]).set(
+    await db.collection("nd_orphans").document(orphan_doc_id(orphan["tx"])).set(
         {"pick_uid": uid, "pick_plan": plan}, merge=True)
 
     who = f"@{cand['username']}" if cand and cand.get("username") not in (None, "—") \
@@ -1136,7 +1136,7 @@ async def cb_grant_span(cq: CallbackQuery, bot: Bot):
     await grant_days(uid, plan, days)
 
     if orphan:
-        await db.collection("nd_orphans").document(orphan["tx"]).set(
+        await db.collection("nd_orphans").document(orphan_doc_id(orphan["tx"])).set(
             {"resolved": True, "granted_days": days, "granted_uid": uid}, merge=True)
 
     # tell the buyer
@@ -1165,7 +1165,7 @@ async def cb_grant_ignore(cq: CallbackQuery):
     async for d in db.collection("nd_orphans").stream():
         o = d.to_dict()
         if o["tx"].startswith(txpref) and not o.get("resolved"):
-            await db.collection("nd_orphans").document(o["tx"]).set(
+            await db.collection("nd_orphans").document(orphan_doc_id(o["tx"])).set(
                 {"resolved": True, "ignored": True}, merge=True)
             break
     await cq.message.edit_text(f"🙈 Dismissed.\n\n{cq.message.text}")
@@ -1321,8 +1321,15 @@ def span_kb(uid: int) -> InlineKeyboardMarkup:
 
 
 
+def orphan_doc_id(tx: str) -> str:
+    """Firestore doc IDs can't contain '/', can't be '.'/'..' and are capped at
+    1500 bytes. TON/Tron hashes can carry slashes or '=', so make them safe."""
+    safe = tx.replace("/", "_").replace("\\", "_").replace(".", "_")
+    return safe[:200] or "unknown"
+
+
 async def orphan_seen(tx: str) -> bool:
-    doc = db.collection("nd_orphans").document(tx)
+    doc = db.collection("nd_orphans").document(orphan_doc_id(tx))
     snap = await doc.get()
     if snap.exists:
         return True
@@ -1364,7 +1371,7 @@ async def alert_orphan(bot: Bot, chain: str, pay: dict, cands: list[dict]):
             seen.add(c["uid"])
 
     # stash the decision so the buttons know the amount/plan later
-    await db.collection("nd_orphans").document(pay["tx"]).set({
+    await db.collection("nd_orphans").document(orphan_doc_id(pay["tx"])).set({
         "tx": pay["tx"], "chain": chain, "amount": pay["amount"],
         "at": now(), "resolved": False,
         "cands": [{"uid": c["uid"], "username": c.get("username", "—"),
