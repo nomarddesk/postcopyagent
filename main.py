@@ -285,6 +285,10 @@ async def quote(chain: str, usd: float) -> float:
 # how big the identifying "dust" step is on each chain
 DUST_STEP = {"ton": 0.0001, "trc20": 0.01, "bep20": 0.01}
 
+# reconciler tuning (these went missing in an earlier edit — that was the crash)
+FUZZY_TOL = 0.04          # accept a payment within 4% if exactly one invoice fits
+ORPHAN_WINDOW = 3 * 3600  # only chase unmatched payments from the last few hours
+
 
 async def open_invoice(uid: int, plan: str, chain: str) -> dict:
     """Amount = round base + a small unique tag. Kept short so people can
@@ -943,7 +947,10 @@ async def cb_mine(cq: CallbackQuery):
         f"#{o['id']} · {CATEGORIES.get(o['category'], {}).get('name', o['category'])} · "
         f"{'🔧 working' if o['status'] == 'working' else '⏳ queued'}"
         for o in rows)
-    await cq.message.edit_text(f"<b>Your open requests</b>\n\n{body}", reply_markup=menu_kb())
+    try:
+        await cq.message.edit_text(f"<b>Your open requests</b>\n\n{body}", reply_markup=menu_kb())
+    except Exception:
+        pass
     await cq.answer()
 
 
