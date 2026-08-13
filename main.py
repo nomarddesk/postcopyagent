@@ -278,8 +278,33 @@ async def ton_usd_rate() -> float:
 
 async def quote(chain: str, usd: float) -> float:
     if chain == "ton":
-        return round(usd / await ton_usd_rate(), 4)
+        return round(usd / await ton_usd_rate(), 2)
     return round(usd, 2)
+
+
+# how big the identifying "dust" step is on each chain
+DUST_STEP = {"ton": 0.0001, "trc20": 0.01, "bep20": 0.01}
+
+
+async def open_invoice(uid: int, plan: str, chain: str) -> dict:
+    """Amount = round base + a small unique tag. Kept short so people can
+    actually type it: 0.6742 TON, 2.37 USDT."""
+    base = await quote(chain, PLANS[plan]["price_usd"])
+    step = DUST_STEP[chain]
+
+    taken = {round(i["amount"], 6) for i in await pending_invoices()
+             if i["chain"] == chain}
+    amount = None
+    for n in random.sample(range(1, 100), 99):
+        candidate = round(base + n * step, 6)
+        if candidate not in taken:
+            amount = candidate
+            break
+    if amount is None:                       # 99 live invoices on one chain
+        amount = round(base + random.randint(100, 199) * step, 6)
+
+    memo = f"ND{random.randint(100000, 999999)}" if CHAINS[chain]["memo"] else ""
+    return await new_invoice(uid, plan, chain, amount, memo)
 
 
 def _ton_comment(m: dict) -> str:
@@ -422,14 +447,6 @@ async def grant(uid: int, plan: str, days: int | None = None):
 
 async def revoke(uid: int):
     await save_sub({"uid": uid, "active": False, "expires_at": now()})
-
-
-async def open_invoice(uid: int, plan: str, chain: str) -> dict:
-    base = await quote(chain, PLANS[plan]["price_usd"])
-    dust = random.randint(1, 9999) / 1e6          # makes each amount unique
-    amount = round(base + dust, 6)
-    memo = f"ND{random.randint(100000, 999999)}" if CHAINS[chain]["memo"] else ""
-    return await new_invoice(uid, plan, chain, amount, memo)
 
 
 def _matches(inv: dict, pay: dict) -> bool:
@@ -1134,6 +1151,75 @@ async def cmd_id(m: Message):
 #  9. BACKGROUND JOBS
 # ==========================================================================
 
+FUZZY_TOL = 0.04          # accept within 4% if only one invoice could fit
+ORPHAN_WINDOW = 3 * 3600  # only chase payments from the last few hours
+
+
+async def orphan_seen(tx: str) -> bool:
+    doc = db.collection("nd_orphans").document(tx)
+    snap = await doc.get()
+    if snap.exists:
+        return True
+    await doc.set({"tx": tx, "at": now()})
+    return False
+
+
+async def alert_orphan(bot: Bot, chain: str, pay: dict, cands: list[dict]):
+    if not INBOX_CHAT_ID or await orphan_seen(pay["tx"]):
+        return
+    ch = CHAINS[chain]
+    if cands:
+        why = (f"{len(cands)} open invoices could match — too close to call:\n"
+               + "\n".join(f"• <code>{c['amount']}</code> → uid <code>{c['uid']}</code>"
+                           for c in cands[:5]))
+    else:
+        why = "No open invoice comes close."
+    await bot.send_message(
+        INBOX_CHAT_ID,
+        f"💰 <b>Unmatched payment</b>\n\n"
+        f"Received <b>{pay['amount']}</b> {ch['asset']} ({ch['label']})\n"
+        f"Comment: <code>{pay['memo'] or '—'}</code>\n"
+        f"Tx: <code>{pay['tx'][:24]}…</code>\n\n{why}\n\n"
+        f"Credit by hand with <code>/give &lt;uid&gt; &lt;plan&gt;</code>")
+
+
+async def job_reconcile(bot: Bot):
+    """Catch payments where someone rounded the amount off."""
+    pend = [i for i in await pending_invoices()
+            if now() - i["created"] < INVOICE_TTL_MIN * 60]
+    if not pend:
+        return
+
+    by_chain: dict[str, list[dict]] = {}
+    for inv in pend:
+        by_chain.setdefault(inv["chain"], []).append(inv)
+
+    for chain, invs in by_chain.items():
+        try:
+            payments = await incoming(chain)
+        except Exception:
+            continue
+        for pay in payments:
+            if pay["ts"] < now() - ORPHAN_WINDOW or await tx_seen(pay["tx"]):
+                continue
+
+            cands = [i for i in invs
+                     if abs(pay["amount"] - i["amount"])
+                     <= max(FUZZY_TOL * i["amount"], 2 * DUST_STEP[chain])]
+
+            if len(cands) == 1:
+                inv = cands[0]
+                await close_invoice(inv["id"], "paid", pay["tx"])
+                await grant(inv["uid"], inv["plan"])
+                log.info("PAID(rounded) %s uid=%s got=%s want=%s",
+                         inv["id"], inv["uid"], pay["amount"], inv["amount"])
+                fresh = await get_invoice(inv["id"])
+                await notify_paid(bot, fresh or inv)
+                invs.remove(inv)
+            else:
+                await alert_orphan(bot, chain, pay, cands)
+
+
 async def job_invoices(bot: Bot):
     for inv in await pending_invoices():
         try:
@@ -1187,6 +1273,7 @@ async def job_stale(bot: Bot):
 def start_jobs(bot: Bot):
     sch = AsyncIOScheduler()
     sch.add_job(job_invoices, "interval", seconds=45, args=[bot])
+    sch.add_job(job_reconcile, "interval", seconds=90, args=[bot])
     sch.add_job(job_expiry, "interval", minutes=15, args=[bot])
     sch.add_job(job_stale, "interval", minutes=30, args=[bot])
     sch.start()
